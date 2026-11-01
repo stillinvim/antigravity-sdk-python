@@ -1524,30 +1524,35 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
         env=merged_env,
     )
 
-    serialized = input_config.SerializeToString()
-    assert process.stdin is not None
-    assert process.stdout is not None
-    assert process.stderr is not None
-    # Note for humans: Pack length as 4-byte uint (little-endian)
-    process.stdin.write(struct.pack("<I", len(serialized)) + serialized)
-    process.stdin.flush()
-    raw_len = process.stdout.read(4)
-    if not raw_len:
-      stderr_output = process.stderr.read().decode("utf-8")
-      raise RuntimeError(
-          f"Failed to read length from stdout. Stderr: {stderr_output}"
+    try:
+      serialized = input_config.SerializeToString()
+      assert process.stdin is not None
+      assert process.stdout is not None
+      assert process.stderr is not None
+      # Note for humans: Pack length as 4-byte uint (little-endian)
+      process.stdin.write(struct.pack("<I", len(serialized)) + serialized)
+      process.stdin.flush()
+      raw_len = process.stdout.read(4)
+      if not raw_len:
+        stderr_output = process.stderr.read().decode("utf-8")
+        raise RuntimeError(
+            f"Failed to read length from stdout. Stderr: {stderr_output}"
+        )
+      length = struct.unpack("<I", raw_len)[0]
+      output_config = localharness_pb2.OutputConfig()
+      output_config.ParseFromString(process.stdout.read(length))
+      # Retry the WebSocket connection with backoff. The harness process may
+      # need a moment to start listening after writing its OutputConfig. We try
+      # localhost first and fall back to 127.0.0.1, as some environments may not
+      # resolve localhost.
+      ws, ws_url = await self._connect_websocket(
+          output_config.port, output_config.api_key, process
       )
-    length = struct.unpack("<I", raw_len)[0]
-    output_config = localharness_pb2.OutputConfig()
-    output_config.ParseFromString(process.stdout.read(length))
-    # Retry the WebSocket connection with backoff. The harness process may
-    # need a moment to start listening after writing its OutputConfig. We try
-    # localhost first and fall back to 127.0.0.1, as some environments may not
-    # resolve localhost.
-    ws, ws_url = await self._connect_websocket(
-        output_config.port, output_config.api_key, process
-    )
-    return process, ws, ws_url
+      return process, ws, ws_url
+    except BaseException:
+      process.kill()
+      process.wait()
+      raise
 
   async def __aenter__(self) -> None:
     """Starts the backend."""
@@ -1580,12 +1585,19 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
             harness_config.harness_side_tools.run_command, sandbox_status
         )
     except Exception as e:
+      await ws.close()
       process.kill()
+      process.wait()
       stderr_output = process.stderr.read().decode("utf-8")
       raise RuntimeError(
           f"Failed to initialize conversation at {ws_url}. Stderr:"
           f" {stderr_output}"
       ) from e
+    except BaseException:
+      await ws.close()
+      process.kill()
+      process.wait()
+      raise
     self._connection = LocalConnection(
         process=process,
         ws=ws,

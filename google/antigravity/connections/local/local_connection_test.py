@@ -5086,6 +5086,45 @@ class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
     ):
       await harness.disconnect_sdk()
 
+  async def test_spawn_harness_early_stdout_eof_kills_and_reaps_process(self):
+    """Verifies localharness process is killed and reaped if stdout returns EOF."""
+    test_utils.patch_default_binary_path(self)
+    strategy = local_connection.LocalConnectionStrategy()
+    self.mock_process.stdin = mock.MagicMock()
+    self.mock_process.stdout = mock.MagicMock()
+    self.mock_process.stdout.read.return_value = b""
+    self.mock_process.stderr = mock.MagicMock()
+    self.mock_process.stderr.read.return_value = b"early crash"
+    with mock.patch.object(
+        subprocess, "Popen", return_value=self.mock_process
+    ):
+      with self.assertRaisesRegex(
+          RuntimeError, "Failed to read length from stdout"
+      ):
+        await strategy._spawn_harness_and_connect_ws()
+    self.mock_process.kill.assert_called_once()
+    self.mock_process.wait.assert_called_once()
+
+  async def test_aenter_cancelled_error_kills_process_and_closes_ws(self):
+    """Verifies BaseException/CancelledError during __aenter__ cleans up WS and process."""
+    test_utils.patch_default_binary_path(self)
+    strategy = local_connection.LocalConnectionStrategy()
+    ws = test_utils.TestWebSocket()
+    ws.close = mock.AsyncMock(wraps=ws.close)
+    ws.recv = mock.AsyncMock(side_effect=asyncio.CancelledError())
+    with mock.patch.object(
+        strategy,
+        "_spawn_harness_and_connect_ws",
+        new=mock.AsyncMock(
+            return_value=(self.mock_process, ws, "ws://127.0.0.1:9999")
+        ),
+    ):
+      with self.assertRaises(asyncio.CancelledError):
+        await strategy.__aenter__()
+    ws.close.assert_awaited_once()
+    self.mock_process.kill.assert_called_once()
+    self.mock_process.wait.assert_called_once()
+
 
 class LocalConnectionUnexpectedCloseTest(unittest.IsolatedAsyncioTestCase):
   """Tests for error surfacing when the harness crashes mid-session."""
